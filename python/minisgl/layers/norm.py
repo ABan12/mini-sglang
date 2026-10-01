@@ -36,3 +36,15 @@ class RMSNormFused(BaseOP):
             return self.rmsnorm(x, self.weight, self.eps), x
         self.fused_add_rmsnorm(x, residual, self.weight, self.eps)
         return x, residual
+
+
+class Qwen35RMSNorm(BaseOP):
+    def __init__(self, size: int, eps: float) -> None:
+        self.eps = eps
+        self.weight = torch.empty(size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = x.float()
+        variance = normalized.pow(2).mean(-1, keepdim=True)
+        normalized = normalized * torch.rsqrt(variance + self.eps)
+        return (normalized * (1.0 + self.weight.float())).to(x.dtype)

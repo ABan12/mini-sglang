@@ -29,7 +29,10 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
-
+    def __post_init__(self) -> None:
+        from minisgl.models.register import require_supported_model
+        require_supported_model(self.model_path)
+       
     @cached_property
     def hf_config(self):
         return cached_load_hf_config(self.model_path)

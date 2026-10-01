@@ -52,9 +52,11 @@ def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: i
         return value
 
 
-def _get_merge_info(key: str):
+def _get_merge_info(key: str, *, merge_qkv: bool = True):
     """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
+        if not merge_qkv and suffix in (".q_proj", ".k_proj", ".v_proj"):
+            continue
         if key.count(suffix):
             return key.replace(suffix, fused_suffix), _SLOT_NAMES[suffix], slots
     return None
@@ -82,6 +84,7 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
+    is_qwen35 = config.model_type == "qwen3_5_text"
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
@@ -89,15 +92,21 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
-                if name.startswith(("vision_tower.", "multi_modal_projector.")):
-                    continue
-                raw = f.get_tensor(name)
-                name = name.removeprefix("language_model.")
+                if is_qwen35:
+                    if name.startswith(("model.visual.", "mtp.")):
+                        continue
+                    name_on_disk = name
+                    name = name.replace("model.language_model.", "model.", 1)
+                else:
+                    if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                        continue
+                    name_on_disk = name
+                    name = name.removeprefix("language_model.")
+                raw = f.get_tensor(name_on_disk)
                 tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw
 
-                if (info := _get_merge_info(name)) is None:
+                if (info := _get_merge_info(name, merge_qkv=not is_qwen35)) is None:
                     out = (name, tensor)
                 else:
                     merged_key, slot, all_slots = info

@@ -1,4 +1,6 @@
 import importlib
+import json
+from pathlib import Path
 
 from .config import ModelConfig
 
@@ -12,6 +14,10 @@ _MODEL_REGISTRY = {
 }
 
 
+
+def is_model_registered( architecture: str) -> bool:
+    return architecture in _MODEL_REGISTRY
+
 def get_model_class(model_architecture: str, model_config: ModelConfig):
     if model_architecture not in _MODEL_REGISTRY:
         raise ValueError(f"Model architecture {model_architecture} not supported")
@@ -20,5 +26,41 @@ def get_model_class(model_architecture: str, model_config: ModelConfig):
     model_cls = getattr(module, class_name)
     return model_cls(model_config)
 
+_UNIMPLEMENTED = {
+    "DeepseekV3ForCausalLM": "MLA attention/cache and routed/shared MoE are not implemented",
+    "Qwen3_5ForConditionalGeneration": (
+        "linear attention, convolution state and hybrid cache are not implemented"
+    ),
+}
 
-__all__ = ["get_model_class"]
+
+def require_supported_model(model_path: str) -> str:
+    folder = Path(model_path)
+    if folder.is_dir():
+        config_path = folder / "config.json"
+    else:
+        from huggingface_hub import hf_hub_download
+        config_path = Path(hf_hub_download(repo_id=model_path, filename="config.json"))
+
+    with config_path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError("config.json must contain an object")
+    architectures = raw.get("architectures")
+    if (
+        not isinstance(architectures, list)
+        or not architectures
+        or not isinstance(architectures[0], str)
+    ):
+        raise ValueError("config.json: architectures[0] is required")
+
+    architecture = architectures[0]
+    if architecture in _UNIMPLEMENTED:
+        raise NotImplementedError(
+            f"{architecture}: {_UNIMPLEMENTED[architecture]} in mini-SGLang"
+        )
+    if not is_model_registered(architecture):
+        raise ValueError(f"Model architecture {architecture} not supported")
+    return architecture
+
+__all__ = ["get_model_class", "is_model_registered", "require_supported_model"]

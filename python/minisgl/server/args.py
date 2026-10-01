@@ -248,6 +248,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
             kwargs["model_path"] = model_path
     del kwargs["model_source"]
 
+    from minisgl.models.register import require_supported_model
+    require_supported_model(kwargs["model_path"])
+    
     if (dtype_str := kwargs["dtype"]) == "auto":
         from minisgl.utils import cached_load_hf_config
 
