@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
@@ -24,7 +24,6 @@ from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 from pydantic import BaseModel, Field
-from starlette.background import BackgroundTask
 
 from .args import ServerArgs
 
@@ -61,6 +60,10 @@ class Message(BaseModel):
     content: str
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class OpenAICompletionRequest(BaseModel):
     """Unified request model for OpenAI-style completions and chat-completions."""
 
@@ -76,7 +79,8 @@ class OpenAICompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stream: bool = False
-    stop: List[str] = []
+    stream_options: StreamOptions | None = None
+    stop: str | List[str] | None = None
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
 
@@ -96,6 +100,15 @@ class ModelList(BaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+def _check_supported_parameters(req: OpenAICompletionRequest) -> None:
+    if req.n != 1:
+        raise HTTPException(status_code=400, detail="Only n=1 is supported")
+    if req.stop:
+        raise HTTPException(status_code=400, detail="stop sequences are not supported")
+    if req.presence_penalty != 0.0 or req.frequency_penalty != 0.0:
+        raise HTTPException(status_code=400, detail="Token penalties are not supported")
+
+
 @dataclass
 class FrontendManager:
     config: ServerArgs
@@ -105,6 +118,7 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    listener_task: asyncio.Task | None = field(default=None, init=False)
 
     def new_user(self) -> int:
         uid = self.uid_counter
@@ -124,66 +138,118 @@ class FrontendManager:
 
     def _create_listener_once(self):
         if not self.initialized:
-            asyncio.create_task(self.listen())
+            self.listener_task = asyncio.create_task(self.listen())
             self.initialized = True
 
     async def send_one(self, msg: BaseTokenizerMsg):
         self._create_listener_once()
         await self.send_tokenizer.put(msg)
 
-    async def wait_for_ack(self, uid: int):
+    async def submit_request(self, text: str | List[Dict[str, str]], params: SamplingParams) -> int:
+        uid = self.new_user()
+        try:
+            await self.send_one(TokenizeMsg(uid=uid, text=text, sampling_params=params))
+        except BaseException:
+            await asyncio.shield(self.abort_user(uid))
+            raise
+        return uid
+
+    def _remove_user(self, uid: int) -> bool:
+        pending = self.ack_map.pop(uid, None)
+        event = self.event_map.pop(uid, None)
+        if event is not None:
+            event.set()
+        return pending is not None
+
+    async def wait_for_ack(self, uid: int, request: Request | None = None):
         event = self.event_map[uid]
+        completed = False
+        try:
+            while True:
+                if request is None:
+                    await event.wait()
+                else:
+                    while not event.is_set():
+                        if await request.is_disconnected():
+                            logger.info("Client disconnected for user %s", uid)
+                            raise asyncio.CancelledError
+                        try:
+                            await asyncio.wait_for(event.wait(), timeout=0.1)
+                        except asyncio.TimeoutError:
+                            pass
+                    if await request.is_disconnected():
+                        raise asyncio.CancelledError
+                event.clear()
 
-        while True:
-            await event.wait()
-            event.clear()
+                if uid not in self.ack_map:
+                    return
+                pending = self.ack_map[uid]
+                self.ack_map[uid] = []
+                for ack in pending:
+                    completed = ack.finished
+                    if ack.error is not None:
+                        raise HTTPException(status_code=400, detail=ack.error)
+                    yield ack
+                    if completed:
+                        return
+        finally:
+            if completed:
+                self._remove_user(uid)
+            else:
+                await asyncio.shield(self.abort_user(uid))
 
-            pending = self.ack_map[uid]
-            self.ack_map[uid] = []
-            ack = None
-            for ack in pending:
-                yield ack
-            if ack and ack.finished:
-                break
-
-        del self.ack_map[uid]
-        del self.event_map[uid]
-
-    async def stream_generate(self, uid: int):
-        async for ack in self.wait_for_ack(uid):
-            yield f"data: {ack.incremental_output}\n".encode()
-            if ack.finished:
-                break
+    async def stream_generate(self, uid: int, request: Request | None = None):
+        try:
+            async with aclosing(self.wait_for_ack(uid, request)) as replies:
+                async for ack in replies:
+                    yield f"data: {ack.incremental_output}\n".encode()
+        except HTTPException as exc:
+            yield f"data: {json.dumps({'error': exc.detail})}\n".encode()
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_chat_completions(self, uid: int):
+    async def stream_chat_completions(
+        self, uid: int, model: str, request: Request, include_usage: bool = False
+    ):
         first_chunk = True
-        async for ack in self.wait_for_ack(uid):
-            delta = {}
-            if first_chunk:
-                delta["role"] = "assistant"
-                first_chunk = False
-            if ack.incremental_output:
-                delta["content"] = ack.incremental_output
+        created = int(time.time())
+        try:
+            async with aclosing(self.wait_for_ack(uid, request)) as replies:
+                async for ack in replies:
+                    delta = {}
+                    if first_chunk:
+                        delta["role"] = "assistant"
+                        first_chunk = False
+                    if ack.incremental_output:
+                        delta["content"] = ack.incremental_output
 
-            chunk = {
-                "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
-                "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n".encode()
-
-            if ack.finished:
-                break
-
-        # send final finish_reason
-        end_chunk = {
-            "id": f"cmpl-{uid}",
-            "object": "text_completion.chunk",
-            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
-        }
-        yield f"data: {json.dumps(end_chunk)}\n\n".encode()
+                    chunk = {
+                        "id": f"chatcmpl-{uid}",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"delta": delta, "index": 0, "finish_reason": ack.finish_reason}],
+                    }
+                    if include_usage:
+                        chunk["usage"] = None
+                    yield f"data: {json.dumps(chunk)}\n\n".encode()
+            if include_usage:
+                usage_chunk = {
+                    "id": f"chatcmpl-{uid}",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": ack.prompt_tokens,
+                        "completion_tokens": ack.completion_tokens,
+                        "total_tokens": ack.prompt_tokens + ack.completion_tokens,
+                    },
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n".encode()
+        except HTTPException as exc:
+            error = {"error": {"message": exc.detail, "type": "invalid_request_error"}}
+            yield f"data: {json.dumps(error)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
@@ -195,20 +261,19 @@ class FrontendManager:
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
                 yield chunk
-        except asyncio.CancelledError:
-            asyncio.create_task(self.abort_user(uid))
-            raise
+        finally:
+            await generator.aclose()
+            await asyncio.shield(self.abort_user(uid))
 
     async def abort_user(self, uid: int):
-        await asyncio.sleep(0.1)
-        if uid in self.ack_map:
-            del self.ack_map[uid]
-        if uid in self.event_map:
-            del self.event_map[uid]
+        if not self._remove_user(uid):
+            return
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
 
     def shutdown(self):
+        if self.listener_task is not None:
+            self.listener_task.cancel()
         self.send_tokenizer.stop()
         self.recv_tokenizer.stop()
 
@@ -229,20 +294,13 @@ app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
 async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=req.prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-            ),
-        )
+    uid = await state.submit_request(
+        req.prompt,
+        SamplingParams(ignore_eos=req.ignore_eos, max_tokens=req.max_tokens),
     )
 
     return StreamingResponse(
-        state.stream_with_cancellation(state.stream_generate(uid), request, uid),
+        state.stream_with_cancellation(state.stream_generate(uid, request), request, uid),
         media_type="text/event-stream",
     )
 
@@ -254,41 +312,42 @@ async def v1_root():
 
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
+    _check_supported_parameters(req)
     state = get_global_state()
     if req.messages:
         prompt = [msg.model_dump() for msg in req.messages]
     else:
-        assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
+        if req.prompt is None:
+            raise HTTPException(status_code=400, detail="Either 'messages' or 'prompt' must be provided")
         prompt = req.prompt
 
-    # TODO: support more sampling parameters
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-            ),
-        )
+    uid = await state.submit_request(
+        prompt,
+        SamplingParams(
+            ignore_eos=req.ignore_eos,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+        ),
     )
 
     if req.stream:
         return StreamingResponse(
-            state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+            state.stream_with_cancellation(
+                state.stream_chat_completions(
+                    uid, req.model, request,
+                    include_usage=req.stream_options is not None and req.stream_options.include_usage,
+                ),
+                request, uid,
+            ),
             media_type="text/event-stream",
         )
 
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
-    async for ack in state.wait_for_ack(uid):
+    async for ack in state.wait_for_ack(uid, request):
         full_content += ack.incremental_output
-        if ack.finished:
-            break
 
     return {
         "id": f"chatcmpl-{uid}",
@@ -299,13 +358,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": full_content},
-                "finish_reason": "stop",
+                "finish_reason": ack.finish_reason,
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
+            "prompt_tokens": ack.prompt_tokens,
+            "completion_tokens": ack.completion_tokens,
+            "total_tokens": ack.prompt_tokens + ack.completion_tokens,
         },
     }
 
@@ -317,33 +376,25 @@ async def available_models():
 
 
 async def shell_completion(req: OpenAICompletionRequest):
+    _check_supported_parameters(req)
     state = get_global_state()
     assert req.messages is not None, "Shell completion only supports chat-completions"
     prompt = [msg.model_dump() for msg in req.messages]
 
-    # TODO: support more sampling parameters
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-            ),
-        )
+    uid = await state.submit_request(
+        prompt,
+        SamplingParams(
+            ignore_eos=req.ignore_eos,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+        ),
     )
-
-    async def _abort():
-        await state.abort_user(uid)
 
     return StreamingResponse(
         state.stream_generate(uid),
         media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
     )
 
 

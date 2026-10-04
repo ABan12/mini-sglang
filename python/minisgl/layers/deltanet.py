@@ -80,6 +80,83 @@ def recurrent_delta_rule(
     return output.transpose(1, 2).contiguous().to(input_dtype), recurrent
 
 
+def chunk_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    decay: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    *,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager chunked delta rule, with FP32 accumulation and a triangular solve.
+
+    Adapted from Transformers v5.17.0 torch_chunk_gated_delta_rule:
+    https://github.com/huggingface/transformers/blob/v5.17.0/src/transformers/models/qwen3_5/modeling_qwen3_5.py
+    Copyright 2025 The Qwen Team and The HuggingFace Inc. team.
+    Licensed under Apache-2.0: https://www.apache.org/licenses/LICENSE-2.0
+    """
+    input_dtype = query.dtype
+    batch_size, length, _, key_dim = key.shape
+    heads, value_dim = value.shape[-2:]
+    query, key, value, beta, decay = [
+        x.transpose(1, 2).to(torch.float32, memory_format=torch.contiguous_format)
+        for x in (query, key, value, beta, decay)
+    ]
+    query = query * torch.rsqrt((query * query).sum(-1, keepdim=True) + 1e-6)
+    key = key * torch.rsqrt((key * key).sum(-1, keepdim=True) + 1e-6)
+    query = query * (key_dim ** -0.5)
+
+    padding = (chunk_size - length % chunk_size) % chunk_size
+    query, key, value = [F.pad(x, (0, 0, 0, padding)) for x in (query, key, value)]
+    beta, decay = [F.pad(x, (0, padding)) for x in (beta, decay)]
+    num_chunks = (length + padding) // chunk_size
+    value_beta = value * beta.unsqueeze(-1)
+    key_beta = key * beta.unsqueeze(-1)
+    query, key, key_beta, value_beta = [
+        x.reshape(batch_size, heads, num_chunks, chunk_size, x.shape[-1])
+        for x in (query, key, key_beta, value_beta)
+    ]
+    decay = decay.reshape(batch_size, heads, num_chunks, chunk_size)
+    upper = torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device).triu(1)
+    cumulative_decay = decay.cumsum(dim=3)
+    pairwise_decay = cumulative_decay.unsqueeze(4) - cumulative_decay.unsqueeze(3)
+    pairwise_decay = pairwise_decay.masked_fill(upper, float("-inf")).exp()
+
+    # Condense the delta updates inside each chunk into a lower-triangular system.
+    system = (key_beta @ key.transpose(-1, -2)) * pairwise_decay
+    attention = (query @ key.transpose(-1, -2)) * pairwise_decay
+    decayed_key_beta = key_beta * cumulative_decay.exp().unsqueeze(-1)
+    new_values = torch.linalg.solve_triangular(
+        system, value_beta, upper=False, unitriangular=True
+    )
+    memory_keys = torch.linalg.solve_triangular(
+        system, decayed_key_beta, upper=False, unitriangular=True
+    )
+    recurrent = (
+        new_values.new_zeros(batch_size, heads, key_dim, value_dim)
+        if initial_state is None
+        else initial_state.to(new_values)
+    )
+    output = torch.zeros_like(new_values)
+    query = query * cumulative_decay.exp().unsqueeze(-1)
+    key = key * (cumulative_decay[..., -1:] - cumulative_decay).exp().unsqueeze(-1)
+    chunk_decay = cumulative_decay[..., -1].exp()[..., None, None]
+    for chunk in range(num_chunks):
+        correction = new_values[:, :, chunk] - memory_keys[:, :, chunk] @ recurrent
+        readout = query[:, :, chunk] @ recurrent
+        output[:, :, chunk] = readout + attention[:, :, chunk] @ correction
+        recurrent = (
+            recurrent * chunk_decay[:, :, chunk]
+            + key[:, :, chunk].transpose(-1, -2) @ correction
+        )
+    output = output.reshape(batch_size, heads, -1, value_dim)[:, :, :length]
+    return output.transpose(1, 2).to(
+        input_dtype, memory_format=torch.contiguous_format
+    ), recurrent
+
+
 class Qwen35GatedDeltaNet(BaseOP):
     def __init__(self, config: ModelConfig) -> None:
         self.num_key_heads = config.linear_num_key_heads
@@ -131,7 +208,8 @@ class Qwen35GatedDeltaNet(BaseOP):
         if repeats > 1:
             query = query.repeat_interleave(repeats, dim=2)
             key = key.repeat_interleave(repeats, dim=2)
-        output, recurrent = recurrent_delta_rule(
+        delta_rule = recurrent_delta_rule if state is not None and length == 1 else chunk_delta_rule
+        output, recurrent = delta_rule(
             query, key, value, decay, beta,
             None if state is None else state.recurrent,
         )

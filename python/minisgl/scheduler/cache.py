@@ -9,16 +9,27 @@ from minisgl.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from minisgl.utils import div_ceil
 
 if TYPE_CHECKING:
+    from minisgl.kvcache.hybrid_pool import HybridKVCache
     from .utils import PendingReq
 
 
 class CacheManager:
-    def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str):
+    def __init__(
+        self,
+        num_pages: int,
+        page_size: int,
+        page_table: torch.Tensor,
+        type: str,
+        hybrid_pool: HybridKVCache | None = None,
+    ):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
-        self.prefix_cache = create_prefix_cache(device=device, type=type)
+        self.prefix_cache = create_prefix_cache(
+            device=device, type="naive" if hybrid_pool is not None else type
+        )
+        self.hybrid_pool = hybrid_pool
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
@@ -53,6 +64,14 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if self.hybrid_pool is not None:
+            if finished:
+                self._free(self.page_table[req.table_idx, : req.cached_len])
+                if req.hybrid_state is not None:
+                    self.hybrid_pool.release(req.hybrid_state)
+                    req.hybrid_state = None
+            return
+
         # ==================================== valid cache region ====================================
         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
         # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
@@ -71,7 +90,14 @@ class CacheManager:
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it
-        self._free(page_indices[old_handle.cached_len : cached_len])
+        duplicate_indices = page_indices[old_handle.cached_len : cached_len]
+        if not finished and cached_len > old_handle.cached_len:
+            # The free may be deferred; preserve the old locations before remapping.
+            duplicate_indices = duplicate_indices.clone()
+            page_indices[old_handle.cached_len : cached_len] = new_handle.get_matched_indices()[
+                old_handle.cached_len : cached_len
+            ]
+        self._free(duplicate_indices)
         if finished:  # this tail part should be freed
             self._free(page_indices[new_handle.cached_len :])
         else:  # keep the tail part, update the handle

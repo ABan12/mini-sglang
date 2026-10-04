@@ -8,6 +8,7 @@ _MODEL_REGISTRY = {
     "LlamaForCausalLM": (".llama", "LlamaForCausalLM"),
     "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),
+    "Qwen3_5ForConditionalGeneration": (".qwen3_5", "Qwen35ForCausalLM"),
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),
     "Mistral3ForConditionalGeneration": (".mistral", "MistralForCausalLM"),
@@ -28,9 +29,6 @@ def get_model_class(model_architecture: str, model_config: ModelConfig):
 
 _UNIMPLEMENTED = {
     "DeepseekV3ForCausalLM": "MLA attention/cache and routed/shared MoE are not implemented",
-    "Qwen3_5ForConditionalGeneration": (
-        "linear attention, convolution state and hybrid cache are not implemented"
-    ),
 }
 
 

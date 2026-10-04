@@ -9,8 +9,10 @@ from minisgl.message import (
     AbortBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
+    DetokenizeAbortMsg,
     DetokenizeMsg,
     ExitMsg,
+    RejectMsg,
     UserMsg,
 )
 from minisgl.utils import init_logger, load_tokenizer
@@ -57,7 +59,11 @@ class Scheduler(SchedulerIOMixin):
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+            self.engine.num_pages,
+            config.page_size,
+            self.engine.page_table,
+            config.cache_type,
+            hybrid_pool=self.engine.kv_cache if self.engine.is_qwen35 else None,
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -119,7 +125,7 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if self.engine.is_qwen35 or ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -150,10 +156,20 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                finished = not req.can_decode
-                if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+                hit_eos = not req.sampling_params.ignore_eos and next_token == self.eos_token_id
+                finished = not req.can_decode or hit_eos
+                finish_reason = ("stop" if hit_eos else "length") if finished else None
+                prompt_tokens = req.max_device_len - req.output_len
+                reply.append(
+                    DetokenizeMsg(
+                        uid=req.uid,
+                        next_token=next_token,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=len(req.input_ids) - prompt_tokens,
+                    )
+                )
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -176,11 +192,19 @@ class Scheduler(SchedulerIOMixin):
             logger.debug_rank0("Received user msg: %s", msg)
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
+            if input_len == 0 or msg.sampling_params.max_tokens <= 0:
+                self.send_result([
+                    RejectMsg(uid=msg.uid, error="Input must be nonempty and max_tokens positive.")
+                ])
+                return
             if max_output_len <= 0:
-                return logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
-                    f"request {msg.uid} is dropped."
-                )
+                self.send_result([
+                    RejectMsg(
+                        uid=msg.uid,
+                        error=f"Input length {input_len} leaves no output space in max_seq_len={max_seq_len}.",
+                    )
+                ])
+                return
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
                 logger.warning_rank0(
@@ -193,6 +217,7 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
+            self.send_result([DetokenizeAbortMsg(uid=msg.uid)])
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -202,13 +227,17 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        self.engine.graph_runner.pad_batch(batch)
+        if self.engine.graph_runner is not None:
+            self.engine.graph_runner.pad_batch(batch)
+        else:
+            batch.padded_reqs = batch.reqs
         self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
+        if self.engine.attn_backend is not None:
+            self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),

@@ -9,6 +9,7 @@ import torch
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
+    from minisgl.kvcache.hybrid_pool import HybridStateHandle
     from minisgl.moe import BaseMoeBackend
 
 
@@ -34,6 +35,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    hybrid_state: HybridStateHandle | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -102,7 +104,7 @@ class Context:
     page_size: int
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
-    attn_backend: BaseAttnBackend = field(init=False)
+    attn_backend: BaseAttnBackend | None = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
     _batch: Batch | None = field(default=None, init=False)

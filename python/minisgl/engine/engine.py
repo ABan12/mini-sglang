@@ -31,6 +31,7 @@ class Engine:
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
+        self.is_qwen35 = config.model_config.model_type == "qwen3_5_text"
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
@@ -60,6 +61,7 @@ class Engine:
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
+            max_running_req=config.max_running_req,
         )
 
         # ======================= Page table initialization ========================
@@ -73,8 +75,10 @@ class Engine:
         )
 
         # ======================= Attention & MoE backend initialization ========================
-        self.ctx.attn_backend = self.attn_backend = create_attention_backend(
-            config.attention_backend, config.model_config
+        self.ctx.attn_backend = self.attn_backend = (
+            None
+            if self.is_qwen35
+            else create_attention_backend(config.attention_backend, config.model_config)
         )
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
@@ -86,6 +90,11 @@ class Engine:
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
         # ======================= Graph capture initialization ========================
+        self.graph_runner = None
+        if self.is_qwen35:
+            logger.info_rank0("Qwen3.5 uses eager execution and request-owned GDN states.")
+            return
+
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
@@ -143,22 +152,39 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
+            if self.is_qwen35:
+                return dict(load_weight(config.model_path, self.device))
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
+        num_cache_layers = (
+            config.model_config.layer_types.count("full_attention")
+            if self.is_qwen35
+            else config.model_config.num_layers
+        )
+        fixed_state_memory = 0
+        if self.is_qwen35:
+            from minisgl.kvcache.hybrid_pool import gdn_state_bytes
+
+            fixed_state_memory = gdn_state_bytes(
+                config.model_config, config.max_running_req, self.dtype
+            )
+            logger.info_rank0(f"Reserving GDN request states: {mem_GB(fixed_state_memory)}")
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
+            * num_cache_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            available_memory = (
+                int(config.memory_ratio * old_free_memory) - model_memory - fixed_state_memory
+            )
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
@@ -191,7 +217,7 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if self.graph_runner is not None and self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -206,7 +232,8 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
-        self.graph_runner.destroy_cuda_graphs()
+        if self.graph_runner is not None:
+            self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -218,6 +245,16 @@ def _align_up_32(num: int) -> int:
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    if config.model_config.model_type == "qwen3_5_text":
+        if config.tp_info.size != 1 or config.dtype != torch.bfloat16:
+            raise NotImplementedError("Qwen3.5 Day 3 supports one GPU with BF16 weights")
+        override("attention_backend", "eager")
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        if hasattr(config, "cache_type"):
+            override("cache_type", "naive")
+        return
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")

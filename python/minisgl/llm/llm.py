@@ -8,7 +8,9 @@ from minisgl.core import SamplingParams
 from minisgl.distributed import DistributedInfo
 from minisgl.message import (
     BaseBackendMsg,
-    DetokenizeMsg,
+    BaseTokenizerMsg,
+    DetokenizeAbortMsg,
+    RejectMsg,
     UserMsg,
 )
 from minisgl.scheduler import Scheduler, SchedulerConfig
@@ -23,6 +25,7 @@ class RequestStatus:
     uid: int
     input_ids: List[int]
     output_ids: List[int]
+    error: str | None = None
 
 
 class LLM(Scheduler):
@@ -68,10 +71,15 @@ class LLM(Scheduler):
         self.pending_requests = self.pending_requests[added:]
         return results
 
-    def offline_send_result(self, reply: List[DetokenizeMsg]) -> None:
+    def offline_send_result(self, reply: List[BaseTokenizerMsg]) -> None:
         for msg in reply:
+            if isinstance(msg, DetokenizeAbortMsg):
+                continue
             status = self.status_map[msg.uid]
-            if not (msg.finished and msg.next_token == self.eos_token_id):
+            if isinstance(msg, RejectMsg):
+                status.error = msg.error
+                continue
+            if not (msg.finish_reason == "stop" and msg.next_token == self.eos_token_id):
                 status.output_ids.append(msg.next_token)
 
     def generate(
@@ -93,6 +101,8 @@ class LLM(Scheduler):
         results: List[Dict[str, str | List[int]]] = []
         for i in range(len(prompts)):
             status = self.status_map[i]
+            if status.error is not None:
+                raise ValueError(status.error)
             output_text = self.tokenizer.decode(status.output_ids)
             results.append({"text": output_text, "token_ids": status.output_ids})
         return results

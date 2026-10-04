@@ -31,3 +31,13 @@ env/
 # .vscode
 .vscode/
 .coverage
+
+# Generated outputs and model weights
+/results/
+htmlcov/
+.pytest_cache/
+.coverage*
+*.safetensors
+.ipynb_checkpoints/
+.DS_Store
+._*

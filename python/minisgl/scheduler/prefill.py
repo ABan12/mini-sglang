@@ -94,12 +94,14 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
-            return self._add_one_req(
+            req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
                 table_idx=chunked_req.table_idx,
                 cached_len=chunked_req.cached_len,
             )
+            req.hybrid_state = chunked_req.hybrid_state
+            return req
 
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx = resource

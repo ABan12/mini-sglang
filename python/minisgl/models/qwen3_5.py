@@ -6,10 +6,13 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from minisgl.core import get_global_ctx
 from minisgl.layers.base import BaseOP, OPList
 from minisgl.layers.deltanet import GDNState, Qwen35GatedDeltaNet
 from minisgl.layers.linear import LinearReplicated
 from minisgl.layers.norm import Qwen35RMSNorm
+
+from .base import BaseLLMModel
 
 if TYPE_CHECKING:
     from .config import ModelConfig, RotaryConfig
@@ -203,7 +206,7 @@ class Qwen35Embedding(BaseOP):
 
 
 class Qwen35TextModel(BaseOP):
-    """The Day 2 parameter graph; the model execution loop belongs to Day 3."""
+    """Text decoder with one history state per layer."""
 
     def __init__(self, config: ModelConfig):
         self.embed_tokens = Qwen35Embedding(config)
@@ -211,6 +214,32 @@ class Qwen35TextModel(BaseOP):
             [Qwen35DecoderLayer(config, i) for i in range(config.num_layers)]
         )
         self.norm = Qwen35RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self._rotary_config = config.rotary_config
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        states: list[GDNState | KVState | None] | None = None,
+    ) -> tuple[torch.Tensor, list[GDNState | KVState]]:
+        x = self.embed_tokens.forward(input_ids)
+        if states is None:
+            states = [None] * len(self.layers.op_list)
+        if position_ids is None:
+            past_length = next(
+                (state.key.shape[2] for state in states if isinstance(state, KVState)), 0
+            )
+            position_ids = torch.arange(
+                past_length, past_length + input_ids.shape[1], device=input_ids.device
+            )[None, :].expand(input_ids.shape[0], -1)
+        position_embeddings = text_position_embeddings(x, position_ids, self._rotary_config)
+        new_states: list[GDNState | KVState] = []
+        for layer, state in zip(self.layers.op_list, states):
+            x, state = layer.forward(
+                x, position_ids, state, position_embeddings=position_embeddings
+            )
+            new_states.append(state)
+        return self.norm.forward(x), new_states
 
 
 class Qwen35TextSkeleton(BaseOP):
@@ -219,13 +248,52 @@ class Qwen35TextSkeleton(BaseOP):
     def __init__(self, config: ModelConfig):
         self.model = Qwen35TextModel(config)
 
+    def forward_tokens(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        states: list[GDNState | KVState | None] | None = None,
+    ) -> tuple[torch.Tensor, list[GDNState | KVState]]:
+        hidden, states = self.model.forward(input_ids, position_ids, states)
+        return F.linear(hidden, self.model.embed_tokens.weight), states
+
+
+class Qwen35ForCausalLM(BaseLLMModel):
+    """Eager engine adapter; each request owns its GDN history slot."""
+
+    def __init__(self, config: ModelConfig):
+        self.model = Qwen35TextModel(config)
+        super().__init__()
+
+    def forward(self) -> torch.Tensor:
+        ctx = get_global_ctx()
+        batch = ctx.batch
+        last_hidden = []
+        offset = 0
+        for req in batch.reqs:
+            length = req.extend_len
+            if req.hybrid_state is None:
+                req.hybrid_state = ctx.kv_cache.allocate(req.uid)
+            past_locations = ctx.page_table[req.table_idx, : req.cached_len]
+            states = ctx.kv_cache.read_states(req.hybrid_state, past_locations)
+            input_ids = batch.input_ids[offset : offset + length].unsqueeze(0)
+            positions = batch.positions[offset : offset + length].unsqueeze(0)
+            hidden, states = self.model.forward(input_ids, positions, states)
+            new_locations = batch.out_loc[offset : offset + length]
+            ctx.kv_cache.write_states(req.hybrid_state, states, new_locations)
+            last_hidden.append(hidden[0, -1])
+            offset += length
+        return F.linear(torch.stack(last_hidden), self.model.embed_tokens.weight)
+
 
 __all__ = [
     "KVState",
     "Qwen35Attention",
     "Qwen35MLP",
     "Qwen35DecoderLayer",
+    "Qwen35TextModel",
     "Qwen35TextSkeleton",
+    "Qwen35ForCausalLM",
     "text_position_embeddings",
     "apply_partial_rotary",
 ]

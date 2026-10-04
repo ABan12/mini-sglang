@@ -30,7 +30,20 @@ def create_kvcache_pool(
     page_size: int,
     dtype: torch.dtype,
     device: torch.device,
+    max_running_req: int = 0,
 ) -> BaseKVCachePool:
+    if model_config.model_type == "qwen3_5_text":
+        from .hybrid_pool import HybridKVCache
+
+        return HybridKVCache(
+            model_config=model_config,
+            num_pages=num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            max_running_req=max_running_req,
+        )
+
     from .mha_pool import MHAKVCache  # TODO: support other variants (e.g. MLA)
 
     return MHAKVCache(

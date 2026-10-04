@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+from itertools import groupby
 from typing import List
 
 import torch
@@ -13,7 +14,9 @@ from minisgl.message import (
     BatchBackendMsg,
     BatchFrontendMsg,
     BatchTokenizerMsg,
+    DetokenizeAbortMsg,
     DetokenizeMsg,
+    RejectMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -64,47 +67,61 @@ def tokenize_worker(
 
             logger.debug(f"Received {len(pending_msg)} messages")
 
-            detokenize_msg = [m for m in pending_msg if isinstance(m, DetokenizeMsg)]
-            tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
-            abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
-            assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) == len(pending_msg)
-            if len(detokenize_msg) > 0:
-                replies = detokenize_manager.detokenize(detokenize_msg)
-                batch_output = BatchFrontendMsg(
-                    data=[
-                        UserReply(
-                            uid=msg.uid,
-                            incremental_output=reply,
-                            finished=msg.finished,
-                        )
-                        for msg, reply in zip(detokenize_msg, replies, strict=True)
-                    ]
-                )
-                if len(batch_output.data) == 1:
-                    batch_output = batch_output.data[0]
-                send_frontend.put(batch_output)
-
-            if len(tokenize_msg) > 0:
-                tensors = tokenize_manager.tokenize(tokenize_msg)
-                batch_output = BatchBackendMsg(
-                    data=[
-                        UserMsg(
-                            uid=msg.uid,
-                            input_ids=t,
-                            sampling_params=msg.sampling_params,
-                        )
-                        for msg, t in zip(tokenize_msg, tensors, strict=True)
-                    ]
-                )
-                if len(batch_output.data) == 1:
-                    batch_output = batch_output.data[0]
-                send_backend.put(batch_output)
-            if len(abort_msg) > 0:
-                batch_output = BatchBackendMsg(
-                    data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]
-                )
-                if len(batch_output.data) == 1:
-                    batch_output = batch_output.data[0]
-                send_backend.put(batch_output)
+            # Batch adjacent messages without moving cancellations past later work.
+            for msg_type, group in groupby(pending_msg, key=type):
+                msgs = list(group)
+                if msg_type is DetokenizeMsg:
+                    replies = detokenize_manager.detokenize(msgs)
+                    batch_output = BatchFrontendMsg(
+                        data=[
+                            UserReply(
+                                uid=msg.uid,
+                                incremental_output=reply,
+                                finished=msg.finished,
+                                finish_reason=msg.finish_reason,
+                                prompt_tokens=msg.prompt_tokens,
+                                completion_tokens=msg.completion_tokens,
+                            )
+                            for msg, reply in zip(msgs, replies, strict=True)
+                        ]
+                    )
+                    if len(batch_output.data) == 1:
+                        batch_output = batch_output.data[0]
+                    send_frontend.put(batch_output)
+                elif msg_type is TokenizeMsg:
+                    tensors = tokenize_manager.tokenize(msgs)
+                    batch_output = BatchBackendMsg(
+                        data=[
+                            UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
+                            for msg, t in zip(msgs, tensors, strict=True)
+                        ]
+                    )
+                    if len(batch_output.data) == 1:
+                        batch_output = batch_output.data[0]
+                    send_backend.put(batch_output)
+                elif msg_type is AbortMsg:
+                    for msg in msgs:
+                        detokenize_manager.abort(msg.uid)
+                    batch_output = BatchBackendMsg(
+                        data=[AbortBackendMsg(uid=msg.uid) for msg in msgs]
+                    )
+                    if len(batch_output.data) == 1:
+                        batch_output = batch_output.data[0]
+                    send_backend.put(batch_output)
+                elif msg_type is DetokenizeAbortMsg:
+                    for msg in msgs:
+                        detokenize_manager.abort(msg.uid)
+                elif msg_type is RejectMsg:
+                    batch_output = BatchFrontendMsg(
+                        data=[
+                            UserReply(uid=msg.uid, incremental_output="", finished=True, error=msg.error)
+                            for msg in msgs
+                        ]
+                    )
+                    if len(batch_output.data) == 1:
+                        batch_output = batch_output.data[0]
+                    send_frontend.put(batch_output)
+                else:
+                    raise TypeError(f"Unknown tokenizer message: {msg_type}")
     except KeyboardInterrupt:
         pass
