@@ -84,6 +84,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        choices=["auto", "int8"],
+        default=ServerArgs.kv_cache_dtype,
+        help="KV storage format. 'auto' uses the model dtype; 'int8' uses per-token/head scales.",
+    )
+
+    parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
         type=int,

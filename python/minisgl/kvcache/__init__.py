@@ -31,7 +31,21 @@ def create_kvcache_pool(
     dtype: torch.dtype,
     device: torch.device,
     max_running_req: int = 0,
+    kv_cache_dtype: str = "auto",
 ) -> BaseKVCachePool:
+    if kv_cache_dtype == "int8":
+        from .quant_pool import QuantizedKVCache
+
+        return QuantizedKVCache(
+            num_kv_heads=model_config.num_kv_heads,
+            num_layers=model_config.num_layers,
+            head_dim=model_config.head_dim,
+            num_pages=num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+        )
+
     if model_config.model_type == "qwen3_5_text":
         from .hybrid_pool import HybridKVCache
 

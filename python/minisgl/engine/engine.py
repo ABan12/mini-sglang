@@ -32,6 +32,7 @@ class Engine:
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _adjust_config(config)
         self.is_qwen35 = config.model_config.model_type == "qwen3_5_text"
+        self.eager_only = self.is_qwen35 or config.attention_backend == "quant-reference"
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
@@ -62,6 +63,7 @@ class Engine:
             device=self.device,
             dtype=self.dtype,
             max_running_req=config.max_running_req,
+            kv_cache_dtype=config.kv_cache_dtype,
         )
 
         # ======================= Page table initialization ========================
@@ -93,6 +95,9 @@ class Engine:
         self.graph_runner = None
         if self.is_qwen35:
             logger.info_rank0("Qwen3.5 uses eager execution and request-owned GDN states.")
+            return
+        if self.eager_only:
+            logger.info_rank0("Quantization reference attention uses eager execution.")
             return
 
         self.dummy_req = Req(
@@ -179,6 +184,23 @@ class Engine:
             * self.dtype.itemsize
             * num_cache_layers
         )
+        self.kv_workspace_reserve = 0
+        if config.kv_cache_dtype == "int8":
+            from minisgl.kvcache.quant_pool import int8_kv_bytes_per_token
+
+            heads = config.model_config.num_kv_heads
+            dim = config.model_config.head_dim
+            cache_per_page = int8_kv_bytes_per_token(num_cache_layers, heads, dim) * config.page_size
+            # One request/layer at a time: INT8 gather, FP32 dequantization,
+            # returned compute-dtype K/V and gathered FP32 scales. SDPA/model
+            # temporaries additionally use the memory outside memory_ratio.
+            self.kv_workspace_reserve = (
+                2 * heads * (dim * (1 + 4 + self.dtype.itemsize) + 4) * config.max_seq_len
+            )
+            fixed_state_memory += self.kv_workspace_reserve
+            logger.info_rank0(
+                f"Reserving INT8 read workspace: {mem_GB(self.kv_workspace_reserve)}"
+            )
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
@@ -186,11 +208,14 @@ class Engine:
                 int(config.memory_ratio * old_free_memory) - model_memory - fixed_state_memory
             )
             num_pages = available_memory // cache_per_page
+            if config.kv_cache_dtype == "int8":
+                num_pages -= 1  # the pool also owns a dummy page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         num_tokens = num_pages * config.page_size
         real_kv_size = num_pages * cache_per_page
-        logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")
+        label = "INT8 K/V + FP32 scales" if config.kv_cache_dtype == "int8" else "K + V"
+        logger.info(f"Allocating {num_tokens} tokens for KV cache, {label} = {mem_GB(real_kv_size)}")
         return num_pages
 
     def _sync_get_memory(self) -> Tuple[int, int]:
@@ -246,6 +271,26 @@ def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
 
+    if config.kv_cache_dtype not in ("auto", "int8"):
+        raise ValueError("kv_cache_dtype must be 'auto' or 'int8'")
+    if (
+        "quant-reference" in config.attention_backend.split(",")
+        and config.attention_backend != "quant-reference"
+    ):
+        raise NotImplementedError("quant-reference must be used as a standalone attention backend")
+    if config.kv_cache_dtype == "int8":
+        if (
+            config.model_config.model_type != "qwen3"
+            or config.tp_info.size != 1
+            or config.dtype != torch.bfloat16
+        ):
+            raise NotImplementedError("INT8 KV currently supports Qwen3 Dense, TP=1, BF16 compute")
+        if config.attention_backend not in ("auto", "quant-reference"):
+            raise ValueError("INT8 KV requires attention_backend='quant-reference' or 'auto'")
+        override("attention_backend", "quant-reference")
+        if hasattr(config, "cache_type"):
+            override("cache_type", "naive")
+
     if config.model_config.model_type == "qwen3_5_text":
         if config.tp_info.size != 1 or config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen3.5 Day 3 supports one GPU with BF16 weights")
@@ -254,6 +299,17 @@ def _adjust_config(config: EngineConfig):
         override("cuda_graph_max_bs", 0)
         if hasattr(config, "cache_type"):
             override("cache_type", "naive")
+        return
+
+    if config.attention_backend == "quant-reference":
+        if (
+            config.model_config.model_type != "qwen3"
+            or config.tp_info.size != 1
+            or config.dtype != torch.bfloat16
+        ):
+            raise NotImplementedError("quant-reference currently supports Qwen3 Dense, TP=1, BF16")
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
         return
 
     if config.attention_backend == "auto":

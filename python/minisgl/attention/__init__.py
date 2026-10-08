@@ -40,6 +40,13 @@ def create_fa_backend(config: ModelConfig):
     return FlashAttentionBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("quant-reference")
+def create_quant_reference_backend(config: ModelConfig):
+    from .quant_reference import QuantReferenceBackend
+
+    return QuantReferenceBackend(config)
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]
