@@ -44,6 +44,42 @@ You can specify the backend using the `--attn` argument. If two values are provi
 
 To minimize CPU launch overhead during decoding, Mini-SGLang supports capturing and replaying CUDA graphs. This feature is enabled by default. The maximum batch size for CUDA graph capture can be set with `--cuda-graph-max-bs n`. Setting `n` to `0` disables this feature.
 
+## INT8 KV Cache
+
+For Qwen3 Dense on one GPU with BF16 computation, `--kv-cache-dtype int8`
+selects the `quant-triton` attention backend. K and V use separate FP32 scales
+per token and KV head. Triton kernels quantize writes and dequantize tiles inside
+paged prefill and split-K decode attention. No persistent BF16 cache copy or
+full-history dequantization workspace is allocated.
+
+Decode CUDA Graph and overlap scheduling remain enabled. The cache management
+strategy is set to `naive`. For example:
+
+```bash
+python -m minisgl --model Qwen/Qwen3-0.6B --dtype bfloat16 \
+    --kv-cache-dtype int8 --max-running-requests 16 --cuda-graph-max-bs 16
+```
+
+For a BF16 performance baseline, use `--kv-cache-dtype auto --attn fi
+--cache-type naive` with the same input tokens, output limits, request concurrency,
+page size, graph sizes, prefill budget, and real cache token capacity
+(`--num-pages`). Quantization is lossy; compare accuracy as well as throughput.
+With head dimension 128, INT8 data plus scales occupy 51.56% of BF16 K/V storage
+at equal capacity, including the same dummy page.
+
+`--attn quant-reference` remains available for diagnostic attention with
+synchronous finite-value validation and temporary BF16 dequantization. That
+reference backend uses eager execution and disables overlap scheduling. The
+Triton GPU path assumes finite model activations, like the native GPU kernels.
+
+GPU correctness tests:
+
+```bash
+python -m pytest -o addopts='' tests/learning/test_quant_decode.py \
+    tests/learning/test_quant_prefill.py tests/learning/test_quant_triton_backend.py \
+    tests/learning/test_quant_triton_config.py
+```
+
 ## Radix Cache
 
 Adopting the original design from [SGLang](https://github.com/sgl-project/sglang.git), Mini-SGLang implements a Radix Cache to manage the Key-Value (KV) cache. This allows the reuse of KV cache for shared prefixes across requests, reducing redundant computation. This feature is enabled by default but can be switched to a naive cache management strategy using `--cache naive`.
